@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package delivery;
+
+option go_package = "github.com/slanalan1203/courier-flow/api;deliverypb";
+
+service DeliveryService {
+  rpc CreateDelivery(CreateDeliveryRequest) returns (Delivery);
+  rpc GetDelivery(GetDeliveryRequest) returns (Delivery);
+  rpc UpdateDeliveryStatus(UpdateDeliveryStatusRequest) returns (Delivery);
+  rpc ListDelivery(ListDeliveryRequest) returns (stream Delivery);
+  rpc ReportLocation(stream LocationPoint) returns (LocationReport);
+  rpc TrackDelivery(stream LocationPoint) returns (stream LocationAck);
+}
+
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_CREATED = 1;
+  DELIVERY_STATUS_PICKED_UP = 2;
+  DELIVERY_STATUS_IN_TRANSIT = 3;
+  DELIVERY_STATUS_DELIVERED = 4;
+}
+
+message CreateDeliveryRequest {
+  string address = 1;
+}
+
+message GetDeliveryRequest {
+  int64 id = 1;
+}
+
+message UpdateDeliveryStatusRequest {
+  int64 id = 1;
+  DeliveryStatus status = 2;
+}
+
+message ListDeliveryRequest {}
+
+message Delivery {
+  int64 id = 1;
+  string address = 2;
+  DeliveryStatus status = 3;
+}
+
+message LocationPoint {
+  int64 delivery_id = 1;
+  double latitude = 2;
+  double longitude = 3;
+}
+
+message LocationReport {
+  int64 delivery_id = 1;
+  int32 points_received = 2;
+}
+
+message LocationAck {
+  int64 delivery_id = 1;
+  int32 accepted_points = 2;
+}
