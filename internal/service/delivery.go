@@ -1,12 +1,10 @@
 package service
 
 import (
-	"cmp"
 	"context"
+	"errors"
 	"io"
-	"slices"
 	"strings"
-	"sync"
 
 	deliverypb "github.com/slanalan1203/courier-flow/api"
 	"google.golang.org/grpc/codes"
@@ -16,14 +14,12 @@ import (
 type DeliveryService struct {
 	deliverypb.UnimplementedDeliveryServiceServer
 
-	mu         sync.RWMutex
-	nextID     int64
-	deliveries map[int64]*deliverypb.Delivery
+	repository DeliveryRepository
 }
 
-func NewDeliveryService() *DeliveryService {
+func NewDeliveryService(repository DeliveryRepository) *DeliveryService {
 	return &DeliveryService{
-		deliveries: make(map[int64]*deliverypb.Delivery),
+		repository: repository,
 	}
 }
 
@@ -36,17 +32,11 @@ func (s *DeliveryService) CreateDelivery(
 		return nil, status.Error(codes.InvalidArgument, "empty address")
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.nextID++
-
-	delivery := &deliverypb.Delivery{
-		Id:      s.nextID,
-		Address: address,
-		Status:  deliverypb.DeliveryStatus_DELIVERY_STATUS_CREATED,
+	delivery, err := s.repository.Create(
+		ctx, address, deliverypb.DeliveryStatus_DELIVERY_STATUS_CREATED)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
-
-	s.deliveries[s.nextID] = delivery
 
 	return delivery, nil
 }
@@ -61,37 +51,39 @@ func (s *DeliveryService) GetDelivery(
 		return nil, status.Error(codes.InvalidArgument, "invalid id")
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	delivery, ok := s.deliveries[id]
-	if !ok {
-		return nil, status.Error(codes.NotFound, "delivery not found")
+	delivery, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return nil, repositoryError(err)
 	}
-	return &deliverypb.Delivery{
-		Id:      delivery.Id,
-		Address: delivery.Address,
-		Status:  delivery.Status,
-	}, nil
+	return delivery, nil
 }
 
 func (s *DeliveryService) UpdateDeliveryStatus(
 	ctx context.Context,
-	req *deliverypb.UpdateDeliveryStatusRequest) (*deliverypb.Delivery, error) {
+	req *deliverypb.UpdateDeliveryStatusRequest,
+) (*deliverypb.Delivery, error) {
 	id := req.GetId()
 	newStatus := req.GetStatus()
+
 	if id <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "invalid id")
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"invalid id",
+		)
 	}
+
 	if newStatus == deliverypb.DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED {
-		return nil, status.Error(codes.InvalidArgument, "status must be specified")
+		return nil, status.Error(
+			codes.InvalidArgument,
+			"status must be specified",
+		)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delivery, ok := s.deliveries[id]
-	if !ok {
-		return nil, status.Error(codes.NotFound, "delivery not found")
+
+	delivery, err := s.repository.Get(ctx, id)
+	if err != nil {
+		return nil, repositoryError(err)
 	}
+
 	if !canTransition(delivery.GetStatus(), newStatus) {
 		return nil, status.Errorf(
 			codes.FailedPrecondition,
@@ -100,79 +92,93 @@ func (s *DeliveryService) UpdateDeliveryStatus(
 			newStatus,
 		)
 	}
-	delivery.Status = newStatus
-	return &deliverypb.Delivery{
-		Id:      delivery.GetId(),
-		Address: delivery.GetAddress(),
-		Status:  delivery.GetStatus(),
-	}, nil
+
+	updated, err := s.repository.UpdateStatus(
+		ctx,
+		id,
+		newStatus,
+	)
+	if err != nil {
+		return nil, repositoryError(err)
+	}
+
+	return updated, nil
 }
 
 func (s *DeliveryService) ListDelivery(
 	req *deliverypb.ListDeliveryRequest,
-	stream deliverypb.DeliveryService_ListDeliveryServer) error {
-	s.mu.RLock()
-	deliveries := make([]*deliverypb.Delivery, 0, len(s.deliveries))
-	for _, delivery := range s.deliveries {
-		deliveries = append(deliveries, &deliverypb.Delivery{
-			Id:      delivery.GetId(),
-			Address: delivery.GetAddress(),
-			Status:  delivery.GetStatus(),
-		})
+	stream deliverypb.DeliveryService_ListDeliveryServer,
+) error {
+	deliveries, err := s.repository.List(stream.Context())
+	if err != nil {
+		return repositoryError(err)
 	}
-	s.mu.RUnlock()
-	slices.SortFunc(deliveries, func(i, j *deliverypb.Delivery) int {
-		return cmp.Compare(i.GetId(), j.GetId())
-	})
+
 	for _, delivery := range deliveries {
 		if err := stream.Send(delivery); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
 func (s *DeliveryService) ReportLocation(
-	stream deliverypb.DeliveryService_ReportLocationServer) error {
+	stream deliverypb.DeliveryService_ReportLocationServer,
+) error {
 	var deliveryID int64
-	var pointReceived int32
+	var pointsReceived int32
 
 	for {
 		point, err := stream.Recv()
+
 		if err == io.EOF {
-			if pointReceived == 0 {
-				return status.Error(codes.InvalidArgument, "no point received")
+			if pointsReceived == 0 {
+				return status.Error(
+					codes.InvalidArgument,
+					"no location points received",
+				)
 			}
+
 			return stream.SendAndClose(&deliverypb.LocationReport{
 				DeliveryId:     deliveryID,
-				PointsReceived: pointReceived,
+				PointsReceived: pointsReceived,
 			})
 		}
+
 		if err != nil {
 			return err
 		}
 
 		id := point.GetDeliveryId()
 		if id <= 0 {
-			return status.Error(codes.InvalidArgument, "invalid id")
+			return status.Error(
+				codes.InvalidArgument,
+				"invalid delivery id",
+			)
 		}
-		if pointReceived == 0 {
-			s.mu.RLock()
-			_, exists := s.deliveries[id]
-			s.mu.RUnlock()
-			if !exists {
-				return status.Error(codes.NotFound, "delivery not found")
+
+		if pointsReceived == 0 {
+			_, err := s.repository.Get(stream.Context(), id)
+			if err != nil {
+				return repositoryError(err)
 			}
+
 			deliveryID = id
-		} else if deliveryID != id {
-			return status.Error(codes.InvalidArgument, "delivery id mismatch")
+		} else if id != deliveryID {
+			return status.Error(
+				codes.InvalidArgument,
+				"all points must belong to one delivery",
+			)
 		}
-		pointReceived++
+
+		pointsReceived++
 	}
 }
 
 func (s *DeliveryService) TrackDelivery(
-	stream deliverypb.DeliveryService_TrackDeliveryServer) error {
+	stream deliverypb.DeliveryService_TrackDeliveryServer,
+) error {
 	var deliveryID int64
 	var acceptedPoints int32
 
@@ -186,25 +192,33 @@ func (s *DeliveryService) TrackDelivery(
 		if err != nil {
 			return err
 		}
+
 		id := point.GetDeliveryId()
 		if id <= 0 {
-			return status.Error(codes.InvalidArgument, "invalid id")
+			return status.Error(
+				codes.InvalidArgument,
+				"invalid delivery id",
+			)
 		}
+
 		if acceptedPoints == 0 {
-			s.mu.RLock()
-			_, exists := s.deliveries[id]
-			s.mu.RUnlock()
-			if !exists {
-				return status.Error(codes.NotFound, "delivery not found")
+			_, err := s.repository.Get(stream.Context(), id)
+			if err != nil {
+				return repositoryError(err)
 			}
+
 			deliveryID = id
-		} else if deliveryID != id {
-			return status.Error(codes.InvalidArgument, "delivery id mismatch")
+		} else if id != deliveryID {
+			return status.Error(
+				codes.InvalidArgument,
+				"delivery id mismatch",
+			)
 		}
+
 		acceptedPoints++
 
 		err = stream.Send(&deliverypb.LocationAck{
-			DeliveryId: deliveryID,
+			DeliveryId:     deliveryID,
 			AcceptedPoints: acceptedPoints,
 		})
 		if err != nil {
@@ -226,4 +240,18 @@ func canTransition(
 	default:
 		return false
 	}
+}
+
+func repositoryError(err error) error {
+	if errors.Is(err, ErrDeliveryNotFound) {
+		return status.Error(
+			codes.NotFound,
+			"delivery not found",
+		)
+	}
+
+	return status.Error(
+		codes.Internal,
+		"internal server error",
+	)
 }
